@@ -89,8 +89,16 @@ def _correct_attn_cp_out_kernel(
     )
     factor = tl.exp(lse_finally) if IS_BASE_E else tl.exp2(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
-    output = output * factor
-    output = tl.where(factor == 0.0, 0.0, output)
+    # An empty local DCP partition may make the backend return NaN output and
+    # LSE. Its softmax weight is zero, but NaN * 0 is still NaN and would
+    # poison the cross-rank reduction. Treat non-finite local LSE as an empty
+    # contribution explicitly.
+    valid_local_lse = (
+        (lse_tmp == lse_tmp)
+        & (lse_tmp != float("inf"))
+        & (lse_tmp != -float("inf"))
+    )
+    output = tl.where(valid_local_lse, output * factor, 0.0)
 
     tl.store(new_output_ptr + output_offsets, output)
 

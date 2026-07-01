@@ -10,9 +10,25 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+
+def _get_dcp_world_size_and_rank() -> tuple[int, int]:
+    try:
+        dcp_group = get_dcp_group()
+        return dcp_group.world_size, dcp_group.rank_in_group
+    except AssertionError:
+        # DCP might not be initialized in testing.
+        return 1, 0
+
+
+def _get_pcp_world_size() -> int:
+    try:
+        return get_pcp_group().world_size
+    except AssertionError:
+        # PCP might not be initialized in testing.
+        return 1
 
 
 class BlockTable:
@@ -26,6 +42,8 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        dcp_world_size: int | None = None,
+        dcp_rank: int | None = None,
     ):
         """
         Args:
@@ -38,6 +56,8 @@ class BlockTable:
             kernel_block_size: The block_size of underlying attention kernel.
                 Will be the same as `block_size` if `block_size` is supported
                 by the attention kernel.
+            dcp_world_size: Effective DCP world size for this KV cache group.
+            dcp_rank: Effective DCP rank for this KV cache group.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -90,13 +110,19 @@ class BlockTable:
             # PCP might not be initialized in testing
             self.pcp_world_size = 1
             self.pcp_rank = 0
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
+        if (dcp_world_size is None) != (dcp_rank is None):
+            raise ValueError(
+                "dcp_world_size and dcp_rank must either both be set or both be None"
+            )
+        if dcp_world_size is None:
+            dcp_world_size, dcp_rank = _get_dcp_world_size_and_rank()
+        assert dcp_rank is not None
+        if dcp_world_size < 1 or not 0 <= dcp_rank < dcp_world_size:
+            raise ValueError(
+                f"Invalid DCP size/rank: world_size={dcp_world_size}, rank={dcp_rank}"
+            )
+        self.dcp_world_size = dcp_world_size
+        self.dcp_rank = dcp_rank
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
@@ -234,10 +260,31 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        dcp_world_sizes: list[int] | None = None,
+        dcp_ranks: list[int] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+        if (dcp_world_sizes is None) != (dcp_ranks is None):
+            raise ValueError(
+                "dcp_world_sizes and dcp_ranks must either both be set or both be None"
+            )
+        if dcp_world_sizes is None:
+            dcp_world_size, dcp_rank = _get_dcp_world_size_and_rank()
+            dcp_world_sizes = [dcp_world_size] * len(block_sizes)
+            dcp_ranks = [dcp_rank] * len(block_sizes)
+        assert dcp_ranks is not None
+        if len(dcp_world_sizes) != len(block_sizes):
+            raise ValueError(
+                f"dcp_world_sizes length ({len(dcp_world_sizes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+        if len(dcp_ranks) != len(block_sizes):
+            raise ValueError(
+                f"dcp_ranks length ({len(dcp_ranks)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
         if max_num_blocks is None:
@@ -245,10 +292,12 @@ class MultiGroupBlockTable:
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
-            total_cp_world_size = get_total_cp_world_size()
+            pcp_world_size = _get_pcp_world_size()
             max_num_blocks = [
-                cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                cdiv(max_model_len, block_size * dcp_world_size * pcp_world_size)
+                for block_size, dcp_world_size in zip(
+                    block_sizes, dcp_world_sizes
+                )
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -274,9 +323,21 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                dcp_world_size,
+                dcp_rank,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for (
+                block_size,
+                kernel_block_size,
+                max_num_blocks_per_req,
+                dcp_world_size,
+                dcp_rank,
+            ) in zip(
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                dcp_world_sizes,
+                dcp_ranks,
             )
         ]
 

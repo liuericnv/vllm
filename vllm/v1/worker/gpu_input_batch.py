@@ -105,6 +105,8 @@ class InputBatch:
         num_spec_tokens: int = 0,
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
+        dcp_world_sizes: list[int] | None = None,
+        dcp_ranks: list[int] | None = None,
         reasoning_config: ReasoningConfig | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
@@ -179,6 +181,8 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             max_num_blocks=max_num_blocks_per_req,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            dcp_world_sizes=dcp_world_sizes,
+            dcp_ranks=dcp_ranks,
         )
 
         # Sampling-related.

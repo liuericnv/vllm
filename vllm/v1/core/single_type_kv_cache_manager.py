@@ -55,6 +55,9 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_id: The id of the kv cache group of this manager.
             scheduler_block_size: The scheduling granularity (LCM of all group
                 block sizes); a multiple of this manager's ``block_size``.
+            dcp_world_size: The effective DCP size for this cache group. In a
+                supported hybrid full-attention/Mamba model, this is the
+                configured DCP size for full attention and 1 for Mamba.
             max_admission_blocks_per_request: Recycling-aware per-request
                 block cap used by `get_num_blocks_to_allocate`. Only set for
                 spec types that recycle blocks across chunks (SWA,

@@ -405,6 +405,46 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
             vllm_config: vLLM Config
         """
         cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+
+        # Hybrid recurrent-attention models need group-specific cache sharding:
+        # full-attention/MLA caches are distributed over DCP ranks, while the
+        # recurrent state must remain available on every rank.  Keep the first
+        # implementation deliberately narrow until prefix-cache checkpointing
+        # and the other stateful feature combinations are made group-aware.
+        if parallel_config.decode_context_parallel_size > 1:
+            unsupported = []
+            if cache_config.enable_prefix_caching:
+                unsupported.append("prefix caching")
+            if parallel_config.prefill_context_parallel_size > 1:
+                unsupported.append("prefill context parallelism")
+            if parallel_config.pipeline_parallel_size > 1:
+                unsupported.append("pipeline parallelism")
+            if parallel_config.cp_kv_cache_interleave_size != 1:
+                unsupported.append("cp_kv_cache_interleave_size != 1")
+            if parallel_config.dcp_comm_backend != "ag_rs":
+                unsupported.append("dcp_comm_backend != 'ag_rs'")
+            if vllm_config.speculative_config is not None:
+                unsupported.append("speculative decoding")
+            if (
+                vllm_config.kv_transfer_config is not None
+                and vllm_config.kv_transfer_config.kv_connector is not None
+            ):
+                unsupported.append("KV transfer/offloading")
+            if cache_config.cache_dtype != "auto":
+                unsupported.append("non-default KV cache dtype")
+            if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is True:
+                unsupported.append("disabled hybrid KV cache manager")
+
+            if unsupported:
+                unsupported_str = ", ".join(unsupported)
+                raise ValueError(
+                    "Decode context parallelism for hybrid attention/recurrent "
+                    "models currently supports only the initial group-aware cache "
+                    f"path; unsupported configuration: {unsupported_str}. "
+                    "Disable these features or set "
+                    "--decode-context-parallel-size=1."
+                )
 
         # Disable calculate_kv_scales for hybrid models: uninitialized
         # recurrent state corrupts scales during the calibration pass.

@@ -12,6 +12,8 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    get_kv_cache_group_dcp_size,
+    validate_hybrid_dcp_groups,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -80,11 +82,33 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
-        # The scheduling granularity (LCM of all group block sizes), must be a multiple
-        # of the hash_block_size and the block size of each group.
+        groups = kv_cache_config.kv_cache_groups
+        is_hybrid = len(groups) > 1
+        if is_hybrid and pcp_world_size > 1:
+            raise ValueError("PCP is not supported with hybrid KV cache groups.")
+
+        if is_hybrid:
+            validate_hybrid_dcp_groups(groups, dcp_world_size)
+            group_dcp_sizes = tuple(
+                get_kv_cache_group_dcp_size(group.kv_cache_spec, dcp_world_size)
+                for group in groups
+            )
+            if dcp_world_size > 1 and enable_caching:
+                raise ValueError("Prefix caching is not supported with hybrid DCP.")
+        else:
+            # Preserve the existing single-group behavior for all cache types.
+            group_dcp_sizes = (dcp_world_size,) * len(groups)
+
+        self.group_dcp_sizes = group_dcp_sizes
+
+        # The scheduling granularity (LCM of all effective group block sizes)
+        # must be a multiple of the hash block size and every manager's block
+        # size.
         assert scheduler_block_size % hash_block_size == 0 and all(
-            scheduler_block_size % g.kv_cache_spec.block_size == 0
-            for g in kv_cache_config.kv_cache_groups
+            scheduler_block_size
+            % (group.kv_cache_spec.block_size * group_dcp_size)
+            == 0
+            for group, group_dcp_size in zip(groups, group_dcp_sizes)
         )
         self.scheduler_block_size = scheduler_block_size
 
@@ -112,7 +136,7 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=self.group_dcp_sizes[i],
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
             )
@@ -553,6 +577,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
         ), "block_size must be divisible by hash_block_size"
+        assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:

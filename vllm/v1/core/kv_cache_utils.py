@@ -604,6 +604,56 @@ def hash_block_tokens(
     )
 
 
+def get_kv_cache_group_dcp_size(
+    kv_cache_spec: KVCacheSpec,
+    dcp_world_size: int,
+) -> int:
+    """Return the effective DCP size for one group in a hybrid cache.
+
+    Full-attention caches, including MLA caches, are sequence-sharded across
+    DCP ranks. Mamba caches hold recurrent state rather than per-token KV and
+    therefore remain replicated across DCP ranks. Other cache types are not
+    supported by hybrid DCP yet.
+
+    This helper describes per-group layout. Callers must only use the Mamba
+    result for an auxiliary group in a hybrid cache; single-group behavior
+    continues to use the configured global DCP size.
+    """
+    if dcp_world_size < 1:
+        raise ValueError(f"dcp_world_size must be positive, got {dcp_world_size}.")
+    if dcp_world_size == 1:
+        return 1
+    if isinstance(kv_cache_spec, FullAttentionSpec):
+        return dcp_world_size
+    if isinstance(kv_cache_spec, MambaSpec):
+        return 1
+    raise ValueError(
+        "Hybrid DCP only supports FullAttentionSpec (including MLA) with "
+        f"optional MambaSpec groups; got {type(kv_cache_spec).__name__}."
+    )
+
+
+def validate_hybrid_dcp_groups(
+    groups: Sequence[KVCacheGroupSpec],
+    dcp_world_size: int,
+) -> None:
+    """Validate the restricted set of KV cache groups supported by DCP."""
+    if dcp_world_size == 1:
+        return
+
+    specs = [group.kv_cache_spec for group in groups]
+    for spec in specs:
+        get_kv_cache_group_dcp_size(spec, dcp_world_size)
+
+    if any(isinstance(spec, MambaSpec) for spec in specs) and not any(
+        isinstance(spec, FullAttentionSpec) for spec in specs
+    ):
+        raise ValueError(
+            "MambaSpec can only use effective DCP size 1 as an auxiliary "
+            "group alongside a FullAttentionSpec group."
+        )
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -612,17 +662,17 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of the
-      DCP/PCP-scaled attention group block sizes and the unscaled mamba group
-      block sizes. Mamba/recurrent groups are replicated per DCP rank (not
-      sharded), so their block size is not multiplied by dcp * pcp.
+      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
+      group's effective block size. Under hybrid DCP, full-attention groups
+      use ``block_size * dcp`` while auxiliary Mamba groups use
+      ``block_size``.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
       block sizes; every group's block size must be divisible by it. Returns
       the scheduler block size (i.e. disables finer hashing) if block hashing
       is inactive or a mamba group's block size diverges from the cache
-      block size (mamba_cache_mode != "align"), or if DCP/PCP > 1.
+      block size (mamba_cache_mode != "align").
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
@@ -633,22 +683,21 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
-        # For hybrid models, attention groups are sharded across DCP/PCP ranks
-        # while mamba/recurrent groups are replicated on every rank. Compute
-        # the scheduler block size as the LCM of the scaled attention block
-        # sizes and the unscaled mamba block sizes.
-        effective_block_sizes = [
-            g.kv_cache_spec.block_size * dcp * pcp
-            if not isinstance(g.kv_cache_spec, MambaSpec)
-            else g.kv_cache_spec.block_size
-            for g in groups
-        ]
-        scheduler_block_size = math.lcm(*effective_block_sizes)
-        # Finer hash-block sizing is not supported when DCP/PCP > 1.
-        return scheduler_block_size, scheduler_block_size
+    if pcp != 1:
+        raise ValueError(
+            "Hybrid KV cache groups with multiple block sizes do not "
+            "support prefill context parallelism (pcp_world_size > 1)."
+        )
 
-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    validate_hybrid_dcp_groups(groups, dcp)
+    if dcp > 1 and cache_config.enable_prefix_caching:
+        raise ValueError("Prefix caching is not supported with hybrid DCP.")
+
+    group_block_sizes = [
+        g.kv_cache_spec.block_size
+        * get_kv_cache_group_dcp_size(g.kv_cache_spec, dcp)
+        for g in groups
+    ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors

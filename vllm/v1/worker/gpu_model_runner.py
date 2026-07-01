@@ -139,6 +139,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.kv_cache_utils import get_kv_cache_group_dcp_size
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -196,10 +197,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    check_attention_cp_compatibility,
-    get_total_cp_world_size,
-)
+from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
@@ -6979,21 +6977,37 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        dcp_world_sizes = []
+        dcp_ranks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
-                continue
-            block_size = kv_cache_group.kv_cache_spec.block_size
+        kv_cache_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        ]
+        for kv_cache_group in kv_cache_groups:
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+            dcp_world_size = (
+                get_kv_cache_group_dcp_size(kv_cache_spec, self.dcp_world_size)
+                if len(kv_cache_groups) > 1
+                else self.dcp_world_size
             )
-            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+            dcp_world_sizes.append(dcp_world_size)
+            dcp_ranks.append(self.dcp_rank if dcp_world_size > 1 else 0)
+            max_num_blocks_per_req = cdiv(
+                max_model_len,
+                block_size
+                * dcp_world_size
+                * self.parallel_config.prefill_context_parallel_size,
+            )
+            if isinstance(kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
                     if self.cache_config.enable_prefix_caching
                     else 1
-                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                ) + kv_cache_spec.num_speculative_blocks
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
@@ -7015,6 +7029,11 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=(
+                    self.parallel_config.cp_kv_cache_interleave_size
+                ),
+                dcp_world_sizes=dcp_world_sizes,
+                dcp_ranks=dcp_ranks,
                 reasoning_config=self.vllm_config.reasoning_config,
             )
 

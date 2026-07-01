@@ -2026,6 +2026,23 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
+        if (
+            model_config is not None
+            and model_config.has_inner_state
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            unsupported.append("hybrid/mamba models with align cache mode")
+
+        if (
+            model_config is not None
+            and model_config.is_hybrid
+            and self.parallel_config.decode_context_parallel_size > 1
+        ):
+            # The initial hybrid-DCP implementation makes the legacy V1 block
+            # tables group-aware.  V2 still has a single scalar CP layout for
+            # every KV-cache group and would shard recurrent state incorrectly.
+            unsupported.append("decode context parallelism with hybrid models")
+
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
 

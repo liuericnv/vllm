@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1384,6 +1385,193 @@ def test_input_batch_with_kernel_block_sizes():
         else:
             assert block_table.use_hybrid_blocks is False
             assert block_table.block_size == kernel_size
+
+
+def test_multi_group_block_table_uses_per_group_dcp_layout():
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_model_len=256,
+        max_num_batched_tokens=32,
+        pin_memory=False,
+        device=torch.device(DEVICE_TYPE),
+        block_sizes=[16, 16],
+        kernel_block_sizes=[16, 16],
+        dcp_world_sizes=[2, 1],
+        dcp_ranks=[1, 0],
+    )
+
+    attention_table, mamba_table = block_table.block_tables
+    assert (attention_table.dcp_world_size, attention_table.dcp_rank) == (2, 1)
+    assert (mamba_table.dcp_world_size, mamba_table.dcp_rank) == (1, 0)
+
+    # The attention table stores half the tokens on each DCP rank, while the
+    # recurrent-state table retains the full, unsharded logical row.
+    assert attention_table.max_num_blocks_per_req == 8
+    assert mamba_table.max_num_blocks_per_req == 16
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_multi_group_slot_mapping_uses_per_group_dcp_layout(
+    monkeypatch, dcp_rank: int
+):
+    import vllm.v1.worker.block_table as block_table_module
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+    kernel_cp_layouts = []
+
+    class ReferenceSlotMappingKernel:
+        def __getitem__(self, grid):
+            def launch(
+                num_tokens,
+                max_num_tokens,
+                query_start_loc,
+                positions,
+                block_table_tensor,
+                block_table_stride,
+                block_size,
+                slot_mapping,
+                **kwargs,
+            ):
+                cp_size = kwargs["TOTAL_CP_WORLD_SIZE"]
+                cp_rank = kwargs["TOTAL_CP_RANK"]
+                interleave = kwargs["CP_KV_CACHE_INTERLEAVE_SIZE"]
+                kernel_cp_layouts.append((cp_size, cp_rank))
+                for token_idx in range(num_tokens):
+                    pos = positions[token_idx].item()
+                    virtual_block_size = block_size * cp_size
+                    block_idx = pos // virtual_block_size
+                    block_number = block_table_tensor.flatten()[block_idx].item()
+                    virtual_offset = pos % virtual_block_size
+                    is_local = (virtual_offset // interleave) % cp_size == cp_rank
+                    local_offset = (
+                        virtual_offset // (cp_size * interleave) * interleave
+                        + virtual_offset % interleave
+                    )
+                    slot_mapping[token_idx] = (
+                        block_number * block_size + local_offset
+                        if is_local
+                        else kwargs["PAD_ID"]
+                    )
+
+            return launch
+
+    monkeypatch.setattr(
+        block_table_module,
+        "_compute_slot_mapping_kernel",
+        ReferenceSlotMappingKernel(),
+    )
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[4, 4],
+        kernel_block_sizes=[4, 4],
+        max_num_blocks=[2, 4],
+        cp_kv_cache_interleave_size=1,
+        dcp_world_sizes=[2, 1],
+        dcp_ranks=[dcp_rank, 0],
+    )
+    block_table.add_row(([3, 4], [5, 6, 7, 8]), row_idx=0)
+    block_table.commit_block_table(num_reqs=1)
+
+    query_start_loc = torch.tensor([0, 16], dtype=torch.int32)
+    positions = torch.arange(16, dtype=torch.int64)
+    block_table.compute_slot_mapping(
+        num_reqs=1,
+        query_start_loc=query_start_loc,
+        positions=positions,
+    )
+
+    assert kernel_cp_layouts == [(2, dcp_rank), (1, 0)]
+    attention_slots = block_table[0].slot_mapping.gpu[:16].tolist()
+    mamba_slots = block_table[1].slot_mapping.gpu[:16].tolist()
+    expected_attention_slots = [
+        (
+            (3 + position // 8) * 4 + (position % 8) // 2
+            if position % 2 == dcp_rank
+            else PAD_SLOT_ID
+        )
+        for position in range(16)
+    ]
+    assert attention_slots == expected_attention_slots
+    assert mamba_slots == list(range(20, 36))
+
+    # Row compaction must move every cache group's differently-sized row in
+    # lockstep, including both virtual MLA blocks around the position-8 wrap.
+    block_table.move_row(src=0, tgt=1)
+    assert block_table[0].num_blocks_per_row[1] == 2
+    assert block_table[1].num_blocks_per_row[1] == 4
+    assert block_table[0].get_numpy_array()[1, :2].tolist() == [3, 4]
+    assert block_table[1].get_numpy_array()[1, :4].tolist() == [5, 6, 7, 8]
+
+
+def test_reinitialize_input_batch_uses_per_group_dcp_and_interleave(monkeypatch):
+    attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["attention"], kv_cache_spec=attention_spec),
+            KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=mamba_spec),
+        ],
+    )
+
+    captured_kwargs = {}
+
+    def mock_input_batch(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(gpu_model_runner_module, "InputBatch", mock_input_batch)
+
+    runner = SimpleNamespace(
+        max_model_len=512,
+        max_encoder_len=0,
+        dcp_world_size=4,
+        dcp_rank=2,
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=7,
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        _init_block_sizes=[32],
+        _init_kernel_block_sizes=[32],
+        max_num_reqs=2,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 128),
+        num_spec_tokens=0,
+        input_batch=SimpleNamespace(
+            logitsprocs=None,
+            logitsprocs_need_output_token_ids=False,
+        ),
+        is_pooling_model=False,
+        vllm_config=SimpleNamespace(reasoning_config=None),
+    )
+
+    GPUModelRunner.may_reinitialize_input_batch(
+        runner, kv_cache_config, kernel_block_sizes=[16, 16]
+    )
+
+    assert captured_kwargs["dcp_world_sizes"] == [4, 1]
+    assert captured_kwargs["dcp_ranks"] == [2, 0]
+    assert captured_kwargs["max_num_blocks_per_req"] == [8, 1]
+    assert captured_kwargs["cp_kv_cache_interleave_size"] == 7
 
 
 def test_hybrid_cache_integration(default_vllm_config, dist_init):

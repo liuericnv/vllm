@@ -30,12 +30,14 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
     get_kv_cache_configs,
+    get_kv_cache_group_dcp_size,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     hash_block_tokens,
     init_none_hash,
     is_kv_cache_spec_uniform,
     make_block_hash_with_group_id,
+    resolve_kv_cache_block_sizes,
     tensor_data,
 )
 from vllm.v1.kv_cache_interface import (
@@ -185,6 +187,272 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_get_kv_cache_group_dcp_size():
+    full_spec = new_kv_cache_spec()
+    mla_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    mamba_spec = new_mamba_spec()
+
+    assert get_kv_cache_group_dcp_size(full_spec, 4) == 4
+    assert get_kv_cache_group_dcp_size(mla_spec, 4) == 4
+    assert get_kv_cache_group_dcp_size(mamba_spec, 4) == 1
+    assert get_kv_cache_group_dcp_size(new_sliding_window_spec(), 1) == 1
+    with pytest.raises(ValueError, match="only supports FullAttentionSpec"):
+        get_kv_cache_group_dcp_size(new_sliding_window_spec(), 4)
+
+
+def _make_hybrid_dcp_kv_cache_config(
+    *,
+    full_block_size: int = 16,
+    mamba_block_size: int = 48,
+) -> KVCacheConfig:
+    return KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["mla"],
+                MLAAttentionSpec(
+                    block_size=full_block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                ),
+            ),
+        ],
+    )
+
+
+def test_resolve_hybrid_dcp_uses_effective_group_block_sizes():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=192))
+    vllm_config.cache_config.block_size = 16
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.parallel_config.decode_context_parallel_size = 4
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
+
+    # MLA covers 16 * 4 = 64 global tokens per local block; Mamba remains 48.
+    # Their scheduler alignment is therefore lcm(64, 48) = 192.
+    assert resolve_kv_cache_block_sizes(
+        _make_hybrid_dcp_kv_cache_config(), vllm_config
+    ) == (192, 192)
+
+
+def test_resolve_hybrid_dcp_rejects_prefix_caching():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=192))
+    vllm_config.cache_config.enable_prefix_caching = True
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+
+    with pytest.raises(ValueError, match="Prefix caching"):
+        resolve_kv_cache_block_sizes(
+            _make_hybrid_dcp_kv_cache_config(), vllm_config
+        )
+
+
+def test_hybrid_dcp_manager_uses_per_group_dcp_sizes():
+    kv_cache_config = _make_hybrid_dcp_kv_cache_config(
+        full_block_size=16, mamba_block_size=16
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=128,
+        scheduler_block_size=64,
+        hash_block_size=64,
+        enable_caching=False,
+        dcp_world_size=4,
+    )
+
+    assert manager.coordinator.group_dcp_sizes == (4, 1)
+    mla_manager, mamba_manager = manager.coordinator.single_type_managers
+    assert mla_manager.block_size == 64
+    assert mamba_manager.block_size == 16
+
+    # 33 tokens need one local MLA block and three replicated Mamba blocks.
+    assert (
+        manager.coordinator.get_num_blocks_to_allocate(
+            request_id="request",
+            num_tokens=33,
+            new_computed_blocks=([], []),
+            num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_tokens_main_model=33,
+        )
+        == 4
+    )
+
+
+def _make_kimi_like_hybrid_dcp_kv_cache_config() -> KVCacheConfig:
+    """Kimi Linear's repeating cache topology: one MLA plus three KDA states."""
+    mamba_groups = [
+        KVCacheGroupSpec(
+            [f"kda.{group_idx}"],
+            MambaSpec(
+                # With prefix caching disabled, recurrent layers use one state
+                # block spanning max_model_len.
+                block_size=128,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+            ),
+        )
+        for group_idx in range(3)
+    ]
+    return KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["mla"],
+                MLAAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float32,
+                ),
+            ),
+            *mamba_groups,
+        ],
+    )
+
+
+def test_kimi_like_hybrid_dcp_topology_allocation_and_free():
+    kv_cache_config = _make_kimi_like_hybrid_dcp_kv_cache_config()
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=128))
+    vllm_config.cache_config.block_size = 16
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
+
+    # MLA has an effective 32-token block. Each KDA group has one replicated
+    # 128-token recurrent-state block, so the common alignment is 128.
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    )
+    assert (scheduler_block_size, hash_block_size) == (128, 128)
+
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=128,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        enable_caching=False,
+        dcp_world_size=2,
+    )
+    assert manager.coordinator.group_dcp_sizes == (2, 1, 1, 1)
+    assert [
+        group_manager.block_size
+        for group_manager in manager.coordinator.single_type_managers
+    ] == [32, 128, 128, 128]
+
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+    request = make_request(
+        "kimi-like",
+        prompt_token_ids=[1] * 128,
+        block_size=128,
+        hash_fn=sha256,
+    )
+
+    # 33 tokens cross the MLA's effective block boundary, while every KDA
+    # group still owns exactly one full recurrent-state block.
+    first_blocks = manager.allocate_slots(request, num_new_tokens=33)
+    assert first_blocks is not None
+    assert [len(group) for group in first_blocks.blocks] == [2, 1, 1, 1]
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks - 5
+
+    first_mla_ids = first_blocks.get_block_ids()[0]
+    assert manager.take_new_block_ids() == first_mla_ids
+
+    # Grow the same request across two more MLA blocks. Recurrent state remains
+    # fixed in place rather than being DCP-sharded or reallocated.
+    request.num_computed_tokens = 33
+    second_blocks = manager.allocate_slots(request, num_new_tokens=64)
+    assert second_blocks is not None
+    assert [len(group) for group in second_blocks.blocks] == [2, 0, 0, 0]
+    assert [len(group) for group in manager.get_blocks(request.request_id).blocks] == [
+        4,
+        1,
+        1,
+        1,
+    ]
+    assert manager.take_new_block_ids() == second_blocks.get_block_ids()[0]
+
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+    assert all(
+        request.request_id not in group_manager.req_to_blocks
+        for group_manager in manager.coordinator.single_type_managers
+    )
+
+
+def test_hybrid_dcp_manager_rejects_unsupported_groups():
+    full_spec = new_kv_cache_spec(block_size=16)
+    sliding_spec = new_sliding_window_spec(block_size=16)
+    unsupported_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], full_spec),
+            KVCacheGroupSpec(["sliding"], sliding_spec),
+        ],
+    )
+    with pytest.raises(ValueError, match="only supports FullAttentionSpec"):
+        KVCacheManager(
+            unsupported_config,
+            max_model_len=128,
+            scheduler_block_size=32,
+            hash_block_size=32,
+            enable_caching=False,
+            dcp_world_size=2,
+        )
+
+    mamba_only_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mamba.0"], new_mamba_spec()),
+            KVCacheGroupSpec(["mamba.1"], new_mamba_spec()),
+        ],
+    )
+    with pytest.raises(ValueError, match="only use effective DCP size 1"):
+        KVCacheManager(
+            mamba_only_config,
+            max_model_len=128,
+            scheduler_block_size=16,
+            hash_block_size=16,
+            enable_caching=False,
+            dcp_world_size=2,
+        )
+
+
+def test_single_group_keeps_global_dcp_size():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=16))],
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=128,
+        scheduler_block_size=32,
+        hash_block_size=32,
+        enable_caching=False,
+        dcp_world_size=2,
+    )
+
+    assert manager.coordinator.group_dcp_sizes == (2,)
+    assert manager.coordinator.single_type_managers[0].block_size == 32
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
