@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from vllm.entrypoints.openai.speech_to_text.protocol import TranscriptionResponse
-from vllm.entrypoints.openai.speech_to_text.speech_to_text import OpenAISpeechToText
+from vllm.entrypoints.speech_to_text.base.serving import OpenAISpeechToText
+from vllm.entrypoints.speech_to_text.transcription.protocol import TranscriptionResponse
 
 
 async def _never_finishes():
@@ -99,8 +99,8 @@ async def test_non_streaming_cancel_advances_all_chunk_generators():
     engine_client = SimpleNamespace(
         errored=False,
         generate=Mock(
-            side_effect=lambda *_args, **_kwargs: (
-                _records_start_then_never_finishes(started_request_ids, _args[2])
+            side_effect=lambda *_args, **_kwargs: _records_start_then_never_finishes(
+                started_request_ids, _args[2]
             )
         ),
         abort=AsyncMock(),
