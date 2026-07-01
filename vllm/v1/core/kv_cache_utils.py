@@ -612,15 +612,17 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of the
+      DCP/PCP-scaled attention group block sizes and the unscaled mamba group
+      block sizes. Mamba/recurrent groups are replicated per DCP rank (not
+      sharded), so their block size is not multiplied by dcp * pcp.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
       block sizes; every group's block size must be divisible by it. Returns
       the scheduler block size (i.e. disables finer hashing) if block hashing
       is inactive or a mamba group's block size diverges from the cache
-      block size (mamba_cache_mode != "align").
+      block size (mamba_cache_mode != "align"), or if DCP/PCP > 1.
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
@@ -632,10 +634,19 @@ def resolve_kv_cache_block_sizes(
         return bs, bs
 
     if dcp != 1 or pcp != 1:
-        raise ValueError(
-            "Hybrid KV cache groups with multiple block sizes do not "
-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
-        )
+        # For hybrid models, attention groups are sharded across DCP/PCP ranks
+        # while mamba/recurrent groups are replicated on every rank. Compute
+        # the scheduler block size as the LCM of the scaled attention block
+        # sizes and the unscaled mamba block sizes.
+        effective_block_sizes = [
+            g.kv_cache_spec.block_size * dcp * pcp
+            if not isinstance(g.kv_cache_spec, MambaSpec)
+            else g.kv_cache_spec.block_size
+            for g in groups
+        ]
+        scheduler_block_size = math.lcm(*effective_block_sizes)
+        # Finer hash-block sizing is not supported when DCP/PCP > 1.
+        return scheduler_block_size, scheduler_block_size
 
     group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)

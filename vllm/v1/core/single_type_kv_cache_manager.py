@@ -67,7 +67,11 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
+        # Mamba/recurrent groups are replicated on every DCP/PCP rank (their
+        # state is not sharded), so their block_size must not be scaled up.
+        if dcp_world_size * pcp_world_size > 1 and not isinstance(
+            kv_cache_spec, MambaSpec
+        ):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
