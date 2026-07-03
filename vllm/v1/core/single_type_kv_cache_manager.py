@@ -70,11 +70,11 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Mamba/recurrent groups are replicated on every DCP/PCP rank (their
-        # state is not sharded), so their block_size must not be scaled up.
-        if dcp_world_size * pcp_world_size > 1 and not isinstance(
-            kv_cache_spec, MambaSpec
-        ):
+        # Hybrid Mamba groups are replicated and therefore receive an
+        # effective DCP size of 1 from the coordinator. Keep the generic
+        # single-group behavior here: a manager passed DCP/PCP > 1 scales its
+        # allocation block size by that effective world size.
+        if dcp_world_size * pcp_world_size > 1:
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
