@@ -5,10 +5,59 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+from vllm.v1.attention.ops.triton_decode_attention import (
+    _compute_page_offset,
+    decode_attention_fwd,
+)
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@triton.jit
+def _page_offset_test_kernel(
+    page_ids,
+    tokens_in_page,
+    offsets,
+    page_stride,
+    token_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    idx = tl.arange(0, BLOCK_SIZE)
+    page_number = tl.load(page_ids + idx)
+    token_in_page = tl.load(tokens_in_page + idx)
+    offset = _compute_page_offset(page_number, token_in_page, page_stride, token_stride)
+    tl.store(offsets + idx, offset)
+
+
+def test_decode_attention_page_offset_uses_int64():
+    page_stride = 240 * 576
+    token_stride = 576
+    page_ids = torch.tensor(
+        [0, 15_534, 15_534, 15_535], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    tokens_in_page = torch.tensor(
+        [0, 110, 111, 0], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    offsets = torch.empty(page_ids.shape, dtype=torch.int64, device=DEVICE_TYPE)
+
+    _page_offset_test_kernel[(1,)](
+        page_ids,
+        tokens_in_page,
+        offsets,
+        page_stride,
+        token_stride,
+        BLOCK_SIZE=page_ids.numel(),
+    )
+
+    expected = (
+        page_ids.to(torch.int64) * page_stride
+        + tokens_in_page.to(torch.int64) * token_stride
+    )
+    assert torch.equal(offsets, expected)
+    assert offsets[1] <= torch.iinfo(torch.int32).max
+    assert torch.all(offsets[2:] > torch.iinfo(torch.int32).max)
 
 
 @pytest.mark.parametrize("B", [3, 5])

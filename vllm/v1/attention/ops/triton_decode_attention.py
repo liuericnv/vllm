@@ -66,6 +66,14 @@ def _page_stride(buf, page_size):
 
 
 @triton.jit
+def _compute_page_offset(page_number, token_in_page, page_stride, token_stride):
+    return (
+        page_number.to(tl.int64) * page_stride
+        + token_in_page.to(tl.int64) * token_stride
+    )
+
+
+@triton.jit
 def _fwd_kernel_stage1(
     Q,
     K_Buffer,
@@ -135,12 +143,11 @@ def _fwd_kernel_stage1(
                 other=0,
             )
             kv_in_page = offs_n % PAGE_SIZE
+            kv_off_k = _compute_page_offset(
+                kv_page_number, kv_in_page, stride_buf_kpbs, stride_buf_kbs
+            )
             offs_buf_k = (
-                (kv_page_number * stride_buf_kpbs + kv_in_page * stride_buf_kbs)[
-                    :, None
-                ]
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
+                kv_off_k[:, None] + cur_kv_head * stride_buf_kh + offs_d[None, :]
             )
             k = tl.load(
                 K_Buffer + offs_buf_k,
@@ -157,12 +164,11 @@ def _fwd_kernel_stage1(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
+            kv_off_v = _compute_page_offset(
+                kv_page_number, kv_in_page, stride_buf_vpbs, stride_buf_vbs
+            )
             offs_buf_v = (
-                (kv_page_number * stride_buf_vpbs + kv_in_page * stride_buf_vbs)[
-                    :, None
-                ]
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
+                kv_off_v[:, None] + cur_kv_head * stride_buf_vh + offs_dv[None, :]
             )
             v = tl.load(
                 V_Buffer + offs_buf_v,
@@ -376,8 +382,9 @@ def _fwd_grouped_kernel_stage1(
                 other=0,
                 cache_modifier=".ca",
             )
-            kv_off_k = (
-                kv_page_number * stride_buf_kpbs + (offs_n % PAGE_SIZE) * stride_buf_kbs
+            kv_in_page = offs_n % PAGE_SIZE
+            kv_off_k = _compute_page_offset(
+                kv_page_number, kv_in_page, stride_buf_kpbs, stride_buf_kbs
             )
 
             # explicitly facilitate overlapping load/compute
@@ -413,9 +420,8 @@ def _fwd_grouped_kernel_stage1(
             )
 
             if not IS_MLA:
-                kv_off_v = (
-                    kv_page_number * stride_buf_vpbs
-                    + (offs_n % PAGE_SIZE) * stride_buf_vbs
+                kv_off_v = _compute_page_offset(
+                    kv_page_number, kv_in_page, stride_buf_vpbs, stride_buf_vbs
                 )
                 offs_buf_v = kv_off_v[:, None] + base_offs_v
                 v = tl.load(
