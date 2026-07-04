@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,6 +19,10 @@ if not current_platform.is_device_capability_family(100):
     )
 else:
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+    from vllm.v1.attention.backends.mla import (
+        flashinfer_mla as flashinfer_mla_module,
+    )
+    from vllm.v1.attention.backends.mla.flashinfer_mla import FlashInferMLAImpl
 
 
 def ref_mla(
@@ -133,3 +138,118 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
     assert lse_ans.shape == (bs, num_heads)
     torch.testing.assert_close(out_ans, out_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse_ans, lse_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("query_len", [1, 2])
+@pytest.mark.parametrize("empty_index", [0, 1])
+@pytest.mark.parametrize("empty_payload", [123.0, float("nan")])
+def test_flashinfer_mla_dcp_masks_empty_local_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    query_len: int,
+    empty_index: int,
+    empty_payload: float,
+):
+    """Empty DCP shards must be neutral even if FlashInfer returns garbage."""
+    device = "cuda"
+    batch_size = 2
+    num_heads = 4
+    kv_lora_rank = 6
+    qk_nope_head_dim = 4
+    qk_rope_head_dim = 2
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    impl = object.__new__(FlashInferMLAImpl)
+    impl.qk_nope_head_dim = qk_nope_head_dim
+    impl.kv_lora_rank = kv_lora_rank
+    impl.qk_rope_head_dim = qk_rope_head_dim
+    impl.kv_cache_dtype = "auto"
+    impl.scale = 0.5
+    impl.bmm1_scale = None
+    impl.bmm2_scale = None
+    impl.need_to_return_lse_for_decode = True
+
+    # This is the per-rank local length passed to FlashInfer by the MLA
+    # metadata builder, not the request's global sequence length.
+    local_lengths = [5, 5]
+    local_lengths[empty_index] = 0
+    seq_lens = torch.tensor(local_lengths, dtype=torch.int32, device=device)
+    metadata = SimpleNamespace(
+        num_decode_tokens=batch_size * query_len,
+        num_decodes=batch_size,
+        max_seq_len=5,
+        decode=SimpleNamespace(
+            block_table=torch.zeros(
+                (batch_size, 1), dtype=torch.int32, device=device
+            ),
+            seq_lens=seq_lens,
+        ),
+    )
+    layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
+
+    kernel_args = {}
+
+    def fake_decode_kernel(**kwargs):
+        kernel_args.update(kwargs)
+        out = torch.full(
+            (batch_size, query_len, num_heads, kv_lora_rank),
+            7.0,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        lse = torch.full(
+            (batch_size * query_len, num_heads),
+            9.0,
+            dtype=torch.float32,
+            device=device,
+        )
+        out[empty_index].fill_(empty_payload)
+        empty_start = empty_index * query_len
+        lse[empty_start : empty_start + query_len].fill_(empty_payload)
+        return out, lse
+
+    monkeypatch.setattr(
+        flashinfer_mla_module,
+        "trtllm_batch_decode_with_kv_cache_mla",
+        fake_decode_kernel,
+    )
+    monkeypatch.setattr(
+        flashinfer_mla_module,
+        "_get_workspace_buffer",
+        lambda return_lse: torch.empty(1, dtype=torch.uint8, device=device),
+    )
+
+    query = torch.zeros(
+        (batch_size * query_len, num_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.zeros(
+        (1, 1, qk_head_dim), dtype=torch.bfloat16, device=device
+    )
+    out, lse = impl.forward_mqa(query, kv_cache, metadata, layer)
+
+    assert kernel_args["seq_lens"].data_ptr() == seq_lens.data_ptr()
+    assert out.shape == (
+        batch_size * query_len,
+        num_heads,
+        kv_lora_rank,
+    )
+    out_by_request = out.view(
+        batch_size, query_len, num_heads, kv_lora_rank
+    )
+    lse_by_request = lse.view(batch_size, query_len, num_heads)
+    assert torch.count_nonzero(out_by_request[empty_index]).item() == 0
+    assert torch.isneginf(lse_by_request[empty_index]).all()
+    nonempty_index = 1 - empty_index
+    torch.testing.assert_close(
+        out_by_request[nonempty_index],
+        torch.full_like(out_by_request[nonempty_index], 7.0),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lse_by_request[nonempty_index],
+        torch.full_like(lse_by_request[nonempty_index], 9.0),
+        rtol=0,
+        atol=0,
+    )

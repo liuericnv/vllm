@@ -231,6 +231,20 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
         if return_lse:
             o, lse = kernel_out
+
+            # A DCP rank can have no local KV tokens for a request. FlashInfer
+            # does not define the output or LSE for an empty local sequence,
+            # so those tensors may contain finite allocator garbage or NaNs.
+            # Make empty shards the neutral element before the cross-rank
+            # softmax reduction: zero attention output and -inf LSE.
+            empty_local_kv = attn_metadata.decode.seq_lens == 0
+            o.masked_fill_(empty_local_kv.view(-1, 1, 1, 1), 0)
+            empty_local_query = (
+                empty_local_kv[:, None]
+                .expand(-1, o.shape[1])
+                .reshape(-1, 1)
+            )
+            lse.masked_fill_(empty_local_query, -float("inf"))
         else:
             o, lse = kernel_out, None
 
