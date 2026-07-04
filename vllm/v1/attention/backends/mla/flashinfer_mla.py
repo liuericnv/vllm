@@ -240,9 +240,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             empty_local_kv = attn_metadata.decode.seq_lens == 0
             o.masked_fill_(empty_local_kv.view(-1, 1, 1, 1), 0)
             empty_local_query = (
-                empty_local_kv[:, None]
-                .expand(-1, o.shape[1])
-                .reshape(-1, 1)
+                empty_local_kv[:, None].expand(-1, o.shape[1]).reshape(-1, 1)
             )
             lse.masked_fill_(empty_local_query, -float("inf"))
         else:

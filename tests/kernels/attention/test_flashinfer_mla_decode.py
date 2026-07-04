@@ -19,6 +19,7 @@ if not current_platform.is_device_capability_family(100):
     )
 else:
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+
     from vllm.v1.attention.backends.mla import (
         flashinfer_mla as flashinfer_mla_module,
     )
@@ -49,9 +50,7 @@ def ref_mla(
 
         # FlashInfer's TRTLLM-gen MLA kernel returns log2 LSE. DCP uses this
         # value to normalize and combine attention outputs across KV shards.
-        logits = torch.matmul(
-            query[i].float(), kv[0].float().transpose(0, 1)
-        ) * scale
+        logits = torch.matmul(query[i].float(), kv[0].float().transpose(0, 1)) * scale
         lse[i] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
 
     return out, lse
@@ -149,7 +148,11 @@ def test_flashinfer_mla_dcp_masks_empty_local_sequences(
     empty_index: int,
     empty_payload: float,
 ):
-    """Empty DCP shards must be neutral even if FlashInfer returns garbage."""
+    """Empty DCP shards must be neutral even if FlashInfer returns garbage.
+
+    DCP currently routes only Q=1 through FlashInfer MLA decode. Q=2 covers
+    output/LSE mask broadcasting, not speculative-decode causality.
+    """
     device = "cuda"
     batch_size = 2
     num_heads = 4
@@ -178,9 +181,7 @@ def test_flashinfer_mla_dcp_masks_empty_local_sequences(
         num_decodes=batch_size,
         max_seq_len=5,
         decode=SimpleNamespace(
-            block_table=torch.zeros(
-                (batch_size, 1), dtype=torch.int32, device=device
-            ),
+            block_table=torch.zeros((batch_size, 1), dtype=torch.int32, device=device),
             seq_lens=seq_lens,
         ),
     )
@@ -223,9 +224,7 @@ def test_flashinfer_mla_dcp_masks_empty_local_sequences(
         dtype=torch.bfloat16,
         device=device,
     )
-    kv_cache = torch.zeros(
-        (1, 1, qk_head_dim), dtype=torch.bfloat16, device=device
-    )
+    kv_cache = torch.zeros((1, 1, qk_head_dim), dtype=torch.bfloat16, device=device)
     out, lse = impl.forward_mqa(query, kv_cache, metadata, layer)
 
     assert kernel_args["seq_lens"].data_ptr() == seq_lens.data_ptr()
@@ -234,9 +233,7 @@ def test_flashinfer_mla_dcp_masks_empty_local_sequences(
         num_heads,
         kv_lora_rank,
     )
-    out_by_request = out.view(
-        batch_size, query_len, num_heads, kv_lora_rank
-    )
+    out_by_request = out.view(batch_size, query_len, num_heads, kv_lora_rank)
     lse_by_request = lse.view(batch_size, query_len, num_heads)
     assert torch.count_nonzero(out_by_request[empty_index]).item() == 0
     assert torch.isneginf(lse_by_request[empty_index]).all()
