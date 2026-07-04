@@ -56,17 +56,39 @@ def test_hybrid_mla_dcp_selects_triton_mla(monkeypatch):
     assert config.attention_config.backend == AttentionBackendEnum.TRITON_MLA
 
 
-def test_hybrid_mla_dcp_rejects_backend_without_lse(monkeypatch):
+@pytest.mark.parametrize(
+    "backend",
+    [AttentionBackendEnum.TRITON_MLA, AttentionBackendEnum.FLASHINFER_MLA],
+)
+def test_hybrid_mla_dcp_accepts_lse_backend(monkeypatch, backend):
     monkeypatch.setattr(
         MambaModelConfig,
         "verify_and_update_config",
         lambda _config: None,
     )
-    config = _make_hybrid_dcp_config(
-        attention_config__backend=AttentionBackendEnum.ROCM_AITER_MLA
-    )
+    config = _make_hybrid_dcp_config(attention_config__backend=backend)
 
-    with pytest.raises(ValueError, match="only TRITON_MLA returns the LSE"):
+    HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.attention_config.backend == backend
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.ROCM_AITER_MLA,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+    ],
+)
+def test_hybrid_mla_dcp_rejects_unvalidated_backend(monkeypatch, backend):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(attention_config__backend=backend)
+
+    with pytest.raises(ValueError, match="TRITON_MLA and FLASHINFER_MLA"):
         HybridAttentionMambaModelConfig.verify_and_update_config(config)
 
 

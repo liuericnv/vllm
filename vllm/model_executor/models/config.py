@@ -426,10 +426,18 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                         "Hybrid MLA decode context parallelism requires attention "
                         "LSE output; selecting TRITON_MLA."
                     )
-                elif attention_backend != AttentionBackendEnum.TRITON_MLA:
+                # FlashInfer MLA returns log2 LSE. MLAAttention forwards the
+                # backend's lse_base_on_e flag to the DCP combine kernel, so
+                # both supported backends provide the normalization metadata
+                # required to merge attention shards correctly.
+                elif attention_backend not in {
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.FLASHINFER_MLA,
+                }:
                     unsupported.append(
                         f"attention backend {attention_backend.name} "
-                        "(only TRITON_MLA returns the LSE required by this path)"
+                        "(hybrid MLA DCP requires decode LSE; supported backends "
+                        "are TRITON_MLA and FLASHINFER_MLA)"
                     )
             if cache_config.enable_prefix_caching:
                 unsupported.append("prefix caching")
