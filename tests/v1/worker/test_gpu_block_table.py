@@ -13,6 +13,48 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    (
+        "manager_block_size",
+        "kernel_block_size",
+        "manager_block_count",
+        "actual_kernel_blocks",
+        "expected_table_width",
+    ),
+    [
+        (960, 64, 1, 15, 16),
+        (480, 32, 3, 45, 48),
+        (256, 64, 3, 12, 12),
+    ],
+)
+def test_block_tables_align_expanded_kernel_width(
+    manager_block_size: int,
+    kernel_block_size: int,
+    manager_block_count: int,
+    actual_kernel_blocks: int,
+    expected_table_width: int,
+):
+    block_tables = BlockTables(
+        block_sizes=[manager_block_size],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[manager_block_count],
+        device=torch.device("cuda"),
+        kernel_block_sizes=[kernel_block_size],
+    )
+
+    assert block_tables.block_tables[0].gpu.shape[1] == expected_table_width
+    assert block_tables.input_block_tables[0].shape[1] == expected_table_width
+    assert expected_table_width % (128 // kernel_block_size) == 0
+
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=(list(range(manager_block_count)),),
+        overwrite=True,
+    )
+    assert block_tables.num_blocks.np[0, 0] == actual_kernel_blocks
+
+
 def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     device = torch.device("cuda")
     block_tables = BlockTables(

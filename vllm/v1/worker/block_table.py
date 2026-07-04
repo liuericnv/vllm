@@ -85,7 +85,18 @@ class BlockTable:
             self.blocks_per_kv_block = block_size // kernel_block_size
             self.use_hybrid_blocks = True
 
-        self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
+        # Some attention kernels (including FlashInfer MLA) require the
+        # expanded kernel block-table width to be a multiple of
+        # ``128 / kernel_block_size``. Align after splitting manager blocks:
+        # aligning the manager-block count first is insufficient when
+        # ``blocks_per_kv_block`` is not itself a compatible multiple.
+        max_num_kernel_blocks = max_num_blocks_per_req * self.blocks_per_kv_block
+        if self.block_size <= 128:
+            alignment = 128 // self.block_size
+            max_num_kernel_blocks = (
+                cdiv(max_num_kernel_blocks, alignment) * alignment
+            )
+        self.max_num_blocks_per_req = max_num_kernel_blocks
 
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32

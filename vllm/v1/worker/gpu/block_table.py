@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
@@ -48,6 +49,10 @@ class BlockTables:
         self.block_tables: list[StagedWriteTensor] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
+            kernel_block_size = self.kernel_block_sizes[i]
+            if kernel_block_size <= 128:
+                alignment = 128 // kernel_block_size
+                max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,11 +9,11 @@ from torch import Tensor
 
 from vllm.platforms import current_platform
 
-FLASHINFER_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+FLASHINFER_LSE_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 
-if not current_platform.has_device_capability(100):
+if not current_platform.is_device_capability_family(100):
     pytest.skip(
-        reason="FlashInfer MLA Requires compute capability of 10 or above.",
+        reason="FlashInfer MLA requires compute capability family 10.x.",
         allow_module_level=True,
     )
 else:
@@ -28,6 +30,7 @@ def ref_mla(
 ):
     bs, num_heads, v_head_dim = out.shape
     head_dim = query.shape[2]
+    lse = torch.empty((bs, num_heads), dtype=torch.float32, device=query.device)
 
     for i in range(bs):
         # gather and flatten KV-cache
@@ -39,7 +42,14 @@ def ref_mla(
         o = F.scaled_dot_product_attention(q, kv, v, scale=scale, enable_gqa=True)
         out[i] = o.view(num_heads, v_head_dim)
 
-    return out
+        # FlashInfer's TRTLLM-gen MLA kernel returns log2 LSE. DCP uses this
+        # value to normalize and combine attention outputs across KV shards.
+        logits = torch.matmul(
+            query[i].float(), kv[0].float().transpose(0, 1)
+        ) * scale
+        lse[i] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
+
+    return out, lse
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -91,10 +101,12 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
     q = torch.randn(bs, num_heads, qk_head_dim).to(dtype)
 
     out_ref = q.new_zeros(bs, num_heads, kv_lora_rank)
-    ref_mla(out_ref, q, kv_cache, scale, block_tables, seq_lens_tensor)
+    out_ref, lse_ref = ref_mla(
+        out_ref, q, kv_cache, scale, block_tables, seq_lens_tensor
+    )
 
     workspace_buffer = torch.zeros(
-        FLASHINFER_WORKSPACE_BUFFER_SIZE,
+        FLASHINFER_LSE_WORKSPACE_BUFFER_SIZE,
         dtype=torch.uint8,
         device=q.device,
     )
@@ -103,7 +115,7 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
     # where q_len_per_request is the MTP query length (=1 without MTP)
     q = q.unsqueeze(1)
 
-    out_ans = trtllm_batch_decode_with_kv_cache_mla(
+    out_ans, lse_ans = trtllm_batch_decode_with_kv_cache_mla(
         query=q,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -114,6 +126,10 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
         bmm1_scale=scale,
+        return_lse=True,
     )
     out_ans = out_ans.squeeze(1)
+    assert lse_ans.dtype == torch.float32
+    assert lse_ans.shape == (bs, num_heads)
     torch.testing.assert_close(out_ans, out_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_ans, lse_ref, atol=1e-2, rtol=1e-2)

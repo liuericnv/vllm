@@ -1352,6 +1352,48 @@ def test_hybrid_block_table_initialization():
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "manager_block_size",
+        "kernel_block_size",
+        "manager_block_count",
+        "actual_kernel_blocks",
+        "expected_table_width",
+    ),
+    [
+        (960, 64, 1, 15, 16),
+        (480, 32, 3, 45, 48),
+        (256, 64, 3, 12, 12),
+    ],
+)
+def test_hybrid_block_table_aligns_expanded_kernel_width(
+    manager_block_size: int,
+    kernel_block_size: int,
+    manager_block_count: int,
+    actual_kernel_blocks: int,
+    expected_table_width: int,
+):
+    from vllm.v1.worker.block_table import BlockTable
+
+    block_table = BlockTable(
+        block_size=manager_block_size,
+        max_num_reqs=2,
+        max_num_blocks_per_req=manager_block_count,
+        max_num_batched_tokens=16,
+        pin_memory=False,
+        device=torch.device(DEVICE_TYPE),
+        kernel_block_size=kernel_block_size,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    assert block_table.max_num_blocks_per_req == expected_table_width
+    assert block_table.block_table.np.shape[1] == expected_table_width
+    assert expected_table_width % (128 // kernel_block_size) == 0
+
+    block_table.append_row(list(range(manager_block_count)), row_idx=0)
+    assert block_table.num_blocks_per_row[0] == actual_kernel_blocks
+
+
 def test_input_batch_with_kernel_block_sizes():
     """Test InputBatch initialization with kernel_block_sizes parameter."""
     max_num_reqs = 10
