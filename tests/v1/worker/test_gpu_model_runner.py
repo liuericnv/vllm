@@ -1765,6 +1765,39 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def test_has_fresh_single_token_prefill() -> None:
+    assert GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([1], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+    )
+    assert GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([4, 1], dtype=np.int32),
+        np.array([0, 0], dtype=np.int32),
+        np.array([4, 8], dtype=np.int32),
+    )
+    assert not GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([1, 1], dtype=np.int32),
+        np.array([1, 3], dtype=np.int32),
+        np.array([2, 8], dtype=np.int32),
+    )
+    assert not GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([2], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+    )
+    assert not GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([1], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+    )
+    assert not GPUModelRunner._has_fresh_single_token_prefill(
+        np.array([], dtype=np.int32),
+        np.array([], dtype=np.int32),
+        np.array([], dtype=np.int32),
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="Attention backend FLASHINFER is only supported on CUDA.",

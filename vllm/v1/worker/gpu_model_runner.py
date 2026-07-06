@@ -3808,6 +3808,21 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    @staticmethod
+    def _has_fresh_single_token_prefill(
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        num_prompt_tokens: np.ndarray,
+    ) -> bool:
+        """Return whether a fresh request has a one-token prefill chunk."""
+        return bool(
+            np.any(
+                (num_scheduled_tokens == 1)
+                & (num_computed_tokens == 0)
+                & (num_prompt_tokens > 0)
+            )
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4131,6 +4146,12 @@ class GPUModelRunner(
                 num_scheduled_tokens_np,
             )
 
+            has_fresh_single_token_prefill = self._has_fresh_single_token_prefill(
+                num_scheduled_tokens_np,
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                self.input_batch.num_prompt_tokens[:num_reqs],
+            )
+
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -4154,6 +4175,12 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                # Query length alone makes a fresh one-token prompt look like
+                # uniform decode. Keep its reset/prefill step out of a
+                # decode-only FULL graph; subsequent decodes remain eligible.
+                force_uniform_decode=(
+                    False if has_fresh_single_token_prefill else None
+                ),
             )
 
             logger.debug(

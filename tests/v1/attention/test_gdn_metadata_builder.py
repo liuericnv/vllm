@@ -155,9 +155,14 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is not None:
+        common = common.replace(
+            is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool)
+        )
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
@@ -196,6 +201,35 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state is not None
     # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
     assert meta.has_initial_state[0].item() is True
+
+
+def test_fresh_single_token_prefill_initializes_state():
+    """A fresh one-token prefill must not reuse a previous request's state."""
+    builder = _create_gdn_builder()
+    batch = BatchSpec(seq_lens=[8, 1], query_lens=[1, 1])
+    meta = _build(builder, batch, is_prefilling=[False, True])
+
+    assert meta.num_decodes == 1
+    assert meta.num_decode_tokens == 1
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 1
+    assert meta.has_initial_state is not None
+    assert meta.has_initial_state.tolist() == [True, False]
+    assert meta.prefill_has_initial_state is not None
+    assert meta.prefill_has_initial_state.tolist() == [False]
+
+
+def test_one_token_extend_keeps_decode_fast_path():
+    """A one-token prompt extension with prior state remains a decode."""
+    builder = _create_gdn_builder()
+    batch = BatchSpec(seq_lens=[8, 12], query_lens=[1, 1])
+    meta = _build(builder, batch, is_prefilling=[False, True])
+
+    assert meta.num_decodes == 2
+    assert meta.num_decode_tokens == 2
+    assert meta.num_prefills == 0
+    assert meta.num_prefill_tokens == 0
+    assert meta.has_initial_state is None
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():

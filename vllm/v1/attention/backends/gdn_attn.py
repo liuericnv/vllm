@@ -209,8 +209,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if spec_sequence_masks is None:
+            # A fresh one-token prompt has no prior recurrent or convolution
+            # state and must take the prefill/reset path. One-token extends
+            # that already have state may keep using the decode/update path.
+            is_prefilling = m.is_prefilling
+            if is_prefilling is None or not torch.any(is_prefilling).item():
+                # Preserve compatibility with synthetic metadata callers and
+                # the common pure-decode fast path.
+                split_result = split_decodes_and_prefills(m, decode_threshold=1)
+            else:
+                seq_lens_cpu = m.seq_lens_cpu_upper_bound
+                assert seq_lens_cpu is not None
+                query_lens_cpu = torch.diff(query_start_loc_cpu)
+                single_token_prefill_rows = is_prefilling & (query_lens_cpu == 1)
+                has_prior_state = seq_lens_cpu > 1
+                prefill_to_decode = single_token_prefill_rows & has_prior_state
+                if torch.any(prefill_to_decode).item():
+                    is_prefilling = is_prefilling.clone()
+                    is_prefilling[prefill_to_decode] = False
+                    m = m.replace(is_prefilling=is_prefilling)
+
+                split_result = split_decodes_and_prefills(
+                    m, decode_threshold=1, treat_short_extends_as_decodes=False
+                )
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_result
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
