@@ -461,8 +461,16 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                 unsupported.append("KV transfer/offloading")
             if cache_config.kv_offloading_size is not None:
                 unsupported.append("KV offloading")
-            if cache_config.cache_dtype != "auto":
-                unsupported.append("non-default KV cache dtype")
+            # Both validated MLA backends support E4M3 KV storage.  ``fp8`` is
+            # the platform-neutral spelling of E4M3 on CUDA and ROCm; retain
+            # the explicit spelling as well so the same command line works on
+            # both platforms.  Keep every other non-default cache format gated
+            # until it has its own hybrid-DCP correctness coverage.
+            if cache_config.cache_dtype not in {"auto", "fp8", "fp8_e4m3"}:
+                unsupported.append(
+                    f"KV cache dtype {cache_config.cache_dtype!r} "
+                    "(supported: auto, fp8, fp8_e4m3)"
+                )
             if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is True:
                 unsupported.append("disabled hybrid KV cache manager")
 

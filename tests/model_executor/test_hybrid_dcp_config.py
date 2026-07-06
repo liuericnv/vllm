@@ -76,6 +76,75 @@ def test_hybrid_mla_dcp_accepts_lse_backend(monkeypatch, backend):
 @pytest.mark.parametrize(
     "backend",
     [
+        None,
+        AttentionBackendEnum.TRITON_MLA,
+        AttentionBackendEnum.FLASHINFER_MLA,
+    ],
+)
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_hybrid_mla_dcp_accepts_e4m3_kv_cache(
+    monkeypatch, backend, cache_dtype
+):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(
+        attention_config__backend=backend,
+        cache_config__cache_dtype=cache_dtype,
+    )
+
+    HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.cache_dtype == cache_dtype
+    expected_backend = backend or AttentionBackendEnum.TRITON_MLA
+    assert config.attention_config.backend == expected_backend
+
+
+@pytest.mark.parametrize(
+    "cache_dtype",
+    [
+        "float16",
+        "bfloat16",
+        "fp8_e5m2",
+        "fp8_ds_mla",
+        "fp8_per_token_head",
+    ],
+)
+def test_hybrid_mla_dcp_rejects_unvalidated_kv_cache_dtype(
+    monkeypatch, cache_dtype
+):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(cache_config__cache_dtype=cache_dtype)
+
+    with pytest.raises(ValueError, match=f"KV cache dtype {cache_dtype!r}"):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+
+def test_hybrid_mla_dcp_fp8_disables_dynamic_scale_calculation(monkeypatch):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(
+        cache_config__cache_dtype="fp8",
+        cache_config__calculate_kv_scales=True,
+    )
+
+    HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.calculate_kv_scales is False
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
         AttentionBackendEnum.ROCM_AITER_MLA,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
     ],
