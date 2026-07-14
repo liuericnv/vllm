@@ -305,8 +305,12 @@ class MambaHybridModelState(DefaultModelState):
                 )
         else:
             # Fill with single value.
+            # InputBatch keeps this mapping as int32 for Triton consumers, but
+            # torch.index_fill_ requires int64 indices. PP can also leave -1
+            # sentinels in filtered rows, which must not update state.
+            valid_idx_mapping = idx_mapping[idx_mapping >= 0].to(torch.int64)
             self.num_accepted_tokens_gpu.index_fill_(
-                0, idx_mapping, max(num_sampled, 1)
+                0, valid_idx_mapping, max(num_sampled, 1)
             )
 
         # Align: save the running state to the block-aligned position when
