@@ -443,7 +443,10 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                 unsupported.append("prefix caching")
             if parallel_config.prefill_context_parallel_size > 1:
                 unsupported.append("prefill context parallelism")
-            if parallel_config.pipeline_parallel_size > 1:
+            if (
+                parallel_config.pipeline_parallel_size > 1
+                and not vllm_config.use_v2_model_runner
+            ):
                 unsupported.append("pipeline parallelism")
             if (
                 parallel_config.cp_kv_cache_interleave_size != 1

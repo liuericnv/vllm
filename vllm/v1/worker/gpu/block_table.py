@@ -27,6 +27,8 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        cp_sizes: list[int] | None = None,
+        cp_ranks: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -40,6 +42,39 @@ class BlockTables:
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
+
+        if cp_sizes is None:
+            cp_sizes = [cp_size] * self.num_kv_cache_groups
+        if cp_ranks is None:
+            cp_ranks = [cp_rank] * self.num_kv_cache_groups
+        if len(cp_sizes) != self.num_kv_cache_groups:
+            raise ValueError(
+                "cp_sizes must have one entry per KV cache group, got "
+                f"{len(cp_sizes)} entries for {self.num_kv_cache_groups} groups."
+            )
+        if len(cp_ranks) != self.num_kv_cache_groups:
+            raise ValueError(
+                "cp_ranks must have one entry per KV cache group, got "
+                f"{len(cp_ranks)} entries for {self.num_kv_cache_groups} groups."
+            )
+        for group_idx, (group_cp_size, group_cp_rank) in enumerate(
+            zip(cp_sizes, cp_ranks)
+        ):
+            if group_cp_size < 1:
+                raise ValueError(
+                    f"cp_sizes[{group_idx}] must be positive, got {group_cp_size}."
+                )
+            if not 0 <= group_cp_rank < group_cp_size:
+                raise ValueError(
+                    f"cp_ranks[{group_idx}]={group_cp_rank} is outside "
+                    f"[0, {group_cp_size})."
+                )
+        self.cp_sizes = cp_sizes
+        self.cp_ranks = cp_ranks
+        self.use_per_group_cp_layout = any(
+            group_cp_size != cp_size or group_cp_rank != cp_rank
+            for group_cp_size, group_cp_rank in zip(cp_sizes, cp_ranks)
+        )
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -93,9 +128,9 @@ class BlockTables:
     def init_block_table_layout_tensors(self) -> None:
         # Called at init and after a CuMem kv_cache wake-up. The ptr tensors
         # cache raw data_ptr() values that go stale once the underlying tensors
-        # are reallocated on wake; block_sizes_tensor needs re-populating
-        # because its storage lives under the kv_cache pool tag and comes back
-        # with undefined contents.
+        # are reallocated on wake; layout tensors need re-populating because
+        # their storage lives under the kv_cache pool tag and comes back with
+        # undefined contents.
         self.block_table_ptrs = self._make_ptr_tensor(
             [b.gpu for b in self.block_tables]
         )
@@ -107,6 +142,17 @@ class BlockTables:
         self.block_sizes_tensor = torch.tensor(
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
         )
+        if self.use_per_group_cp_layout:
+            self.cp_sizes_tensor = torch.tensor(
+                self.cp_sizes, dtype=torch.int32, device=self.device
+            )
+            self.cp_ranks_tensor = torch.tensor(
+                self.cp_ranks, dtype=torch.int32, device=self.device
+            )
+        else:
+            # The scalar-specialized kernel does not dereference these arguments.
+            self.cp_sizes_tensor = self.block_sizes_tensor
+            self.cp_ranks_tensor = self.block_sizes_tensor
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
     def append_block_ids(
@@ -181,8 +227,11 @@ class BlockTables:
             self.block_sizes_tensor,
             self.slot_mappings,
             self.slot_mappings.stride(0),
+            self.cp_sizes_tensor,
+            self.cp_ranks_tensor,
             self.cp_rank,
             CP_SIZE=self.cp_size,
+            USE_PER_GROUP_CP_LAYOUT=self.use_per_group_cp_layout,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
@@ -252,8 +301,11 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
+    cp_sizes,  # [num_kv_cache_groups]
+    cp_ranks,  # [num_kv_cache_groups]
     cp_rank,
     CP_SIZE: tl.constexpr,
+    USE_PER_GROUP_CP_LAYOUT: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -277,6 +329,12 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
+    if USE_PER_GROUP_CP_LAYOUT:
+        group_cp_size = tl.load(cp_sizes + group_id)
+        group_cp_rank = tl.load(cp_ranks + group_id)
+    else:
+        group_cp_size = CP_SIZE
+        group_cp_rank = cp_rank
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -285,19 +343,19 @@ def _compute_slot_mappings_kernel(
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
-        block_indices = positions // (block_size * CP_SIZE)
-        block_offsets = positions % (block_size * CP_SIZE)
+        block_indices = positions // (block_size * group_cp_size)
+        block_offsets = positions % (block_size * group_cp_size)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices
         )
 
-        if CP_SIZE == 1:
+        if not USE_PER_GROUP_CP_LAYOUT and CP_SIZE == 1:
             # Common case: Context parallelism is not used.
             slot_ids = block_numbers * block_size + block_offsets
         else:
             # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
+            is_local = block_offsets // CP_INTERLEAVE % group_cp_size == group_cp_rank
+            rounds = block_offsets // (CP_INTERLEAVE * group_cp_size)
             remainder = block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             slot_ids = block_numbers * block_size + local_offsets

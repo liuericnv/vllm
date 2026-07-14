@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
@@ -172,3 +173,53 @@ def test_block_tables_apply_staged_writes_single_group():
         block_tables.block_tables[0].gpu[0, :2],
         torch.tensor([1, 2], dtype=torch.int32, device=device),
     )
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_slot_mappings_use_per_group_cp_layout(dcp_rank: int):
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[4, 4],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4, 4],
+        device=device,
+        kernel_block_sizes=[4, 4],
+        cp_size=2,
+        cp_rank=dcp_rank,
+        cp_sizes=[2, 1],
+        cp_ranks=[dcp_rank, 0],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([10, 11], [20, 21, 22]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    slot_mappings = block_tables.compute_slot_mappings(
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 10], dtype=torch.int32, device=device),
+        positions=torch.arange(10, dtype=torch.int64, device=device),
+        num_tokens_padded=12,
+    )
+    torch.accelerator.synchronize()
+
+    expected_attention = []
+    attention_blocks = [10, 11]
+    for position in range(10):
+        virtual_offset = position % 8
+        if virtual_offset % 2 != dcp_rank:
+            expected_attention.append(PAD_SLOT_ID)
+        else:
+            block_number = attention_blocks[position // 8]
+            expected_attention.append(block_number * 4 + virtual_offset // 2)
+    expected_attention.extend([PAD_SLOT_ID, PAD_SLOT_ID])
+
+    recurrent_blocks = [20, 21, 22]
+    expected_recurrent = [
+        recurrent_blocks[position // 4] * 4 + position % 4 for position in range(10)
+    ]
+    expected_recurrent.extend([PAD_SLOT_ID, PAD_SLOT_ID])
+
+    assert slot_mappings.tolist() == [expected_attention, expected_recurrent]

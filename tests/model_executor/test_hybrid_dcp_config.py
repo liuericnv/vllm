@@ -33,6 +33,7 @@ def _make_hybrid_dcp_config(**overrides):
         speculative_config=None,
         kv_transfer_config=None,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        use_v2_model_runner=True,
     )
     for path, value in overrides.items():
         target = config
@@ -82,9 +83,7 @@ def test_hybrid_mla_dcp_accepts_lse_backend(monkeypatch, backend):
     ],
 )
 @pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
-def test_hybrid_mla_dcp_accepts_e4m3_kv_cache(
-    monkeypatch, backend, cache_dtype
-):
+def test_hybrid_mla_dcp_accepts_e4m3_kv_cache(monkeypatch, backend, cache_dtype):
     monkeypatch.setattr(
         MambaModelConfig,
         "verify_and_update_config",
@@ -112,9 +111,7 @@ def test_hybrid_mla_dcp_accepts_e4m3_kv_cache(
         "fp8_per_token_head",
     ],
 )
-def test_hybrid_mla_dcp_rejects_unvalidated_kv_cache_dtype(
-    monkeypatch, cache_dtype
-):
+def test_hybrid_mla_dcp_rejects_unvalidated_kv_cache_dtype(monkeypatch, cache_dtype):
     monkeypatch.setattr(
         MambaModelConfig,
         "verify_and_update_config",
@@ -171,9 +168,7 @@ def test_hybrid_mla_dcp_rejects_unvalidated_backend(monkeypatch, backend):
         ({"cache_config__kv_offloading_size": 4.0}, "KV offloading"),
     ],
 )
-def test_hybrid_dcp_rejects_deferred_unsupported_options(
-    monkeypatch, overrides, error
-):
+def test_hybrid_dcp_rejects_deferred_unsupported_options(monkeypatch, overrides, error):
     monkeypatch.setattr(
         MambaModelConfig,
         "verify_and_update_config",
@@ -182,4 +177,30 @@ def test_hybrid_dcp_rejects_deferred_unsupported_options(
     config = _make_hybrid_dcp_config(**overrides)
 
     with pytest.raises(ValueError, match=error):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+
+def test_hybrid_dcp_accepts_pipeline_parallelism_with_v2(monkeypatch):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(parallel_config__pipeline_parallel_size=2)
+
+    HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+
+def test_hybrid_dcp_rejects_pipeline_parallelism_with_v1(monkeypatch):
+    monkeypatch.setattr(
+        MambaModelConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    config = _make_hybrid_dcp_config(
+        parallel_config__pipeline_parallel_size=2,
+        use_v2_model_runner=False,
+    )
+
+    with pytest.raises(ValueError, match="pipeline parallelism"):
         HybridAttentionMambaModelConfig.verify_and_update_config(config)

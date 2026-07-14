@@ -48,6 +48,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.core.kv_cache_utils import get_kv_cache_group_dcp_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -412,14 +413,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        group_dcp_sizes = []
+        group_dcp_ranks = []
+        num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            group_dcp_size = (
+                get_kv_cache_group_dcp_size(spec, self.dcp_size)
+                if num_kv_cache_groups > 1
+                else self.dcp_size
+            )
+            group_dcp_sizes.append(group_dcp_size)
+            group_dcp_ranks.append(self.dcp_rank if group_dcp_size > 1 else 0)
             # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
+            # One block on the current rank covers `block_size * group_dcp_size`
+            # tokens in the full, global sequence.
             max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
+                block_table_max_model_len, spec.block_size * group_dcp_size
             )
             # Align to a multiple of (128 / block_size) as required by some attention
             # backends such as TRTLLM (#39324)
@@ -432,6 +443,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     max_num_blocks if self.cache_config.enable_prefix_caching else 1
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
+
+        if len(set(group_dcp_sizes)) > 1:
+            logger.info(
+                "Using per-KV-cache-group DCP layouts: sizes=%s, ranks=%s",
+                group_dcp_sizes,
+                group_dcp_ranks,
+            )
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
@@ -446,6 +464,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            cp_sizes=group_dcp_sizes,
+            cp_ranks=group_dcp_ranks,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
@@ -836,6 +856,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
+    @staticmethod
+    def _has_fresh_single_token_prefill(
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        num_prompt_tokens: np.ndarray,
+    ) -> bool:
+        """Return whether a fresh request has a one-token prefill chunk."""
+        return bool(
+            np.any(
+                (num_scheduled_tokens == 1)
+                & (num_computed_tokens == 0)
+                & (num_prompt_tokens > 0)
+            )
+        )
+
+    def _get_uniform_token_count(
+        self,
+        scheduler_output: SchedulerOutput,
+        dummy_run: bool,
+    ) -> int | None:
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if dummy_run or not self.model_config.has_inner_state:
+            return uniform_tok_count
+
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        req_indices = np.fromiter(
+            map(self.req_states.req_id_to_index.get, req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        num_scheduled_tokens = np.fromiter(
+            map(scheduler_output.num_scheduled_tokens.get, req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        if self._has_fresh_single_token_prefill(
+            num_scheduled_tokens,
+            self.req_states.num_computed_tokens_np[req_indices],
+            self.req_states.prompt_len.np[req_indices],
+        ):
+            # A fresh one-token prompt is a prefill/reset step, not decode.
+            return None
+        return uniform_tok_count
+
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
@@ -1134,8 +1201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
-        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        uniform_tok_count = self._get_uniform_token_count(scheduler_output, dummy_run)
 
         num_active_loras = 0
         if self.lora_config:
