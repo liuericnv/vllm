@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -240,3 +240,41 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache.stride(0) == spec.page_size_bytes
     assert kv_cache.stride(1) == 16 * 1 * 8
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
+
+
+def test_reshape_padded_mamba_cache_strides_by_page():
+    num_blocks = 3
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2,), (3,)),
+        dtypes=(torch.float32, torch.float16),
+        page_size_padded=64,
+    )
+    raw_tensors = {
+        "layer": torch.zeros(spec.page_size_bytes * num_blocks, dtype=torch.int8)
+    }
+    attn_groups = [
+        AttentionGroup(
+            backend=FakeFlashAttentionBackend,
+            layer_names=["layer"],
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+        )
+    ]
+
+    state_tensors = _reshape_kv_cache(
+        attn_groups,
+        raw_tensors,
+        "auto",
+        [spec.block_size],
+        {},
+    )["layer"]
+    conv_state, ssm_state = state_tensors
+
+    assert conv_state.shape == (num_blocks, 2)
+    assert conv_state.stride(0) == spec.page_size_bytes // 4
+    assert conv_state[1].storage_offset() == spec.page_size_bytes // 4
+    assert ssm_state.shape == (num_blocks, 3)
+    assert ssm_state.stride(0) == spec.page_size_bytes // 2
+    assert ssm_state[0].storage_offset() == 8 // 2
+    assert ssm_state[1].storage_offset() == (spec.page_size_bytes + 8) // 2

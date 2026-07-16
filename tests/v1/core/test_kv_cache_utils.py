@@ -2685,6 +2685,44 @@ def test_unify_kv_cache_page_size_padding_requires_backend_support():
         kv_cache_utils.unify_kv_cache_spec_page_size(specs)
 
 
+def test_unify_kv_cache_page_size_pads_mamba_state_pages():
+    """A Mamba-only PP stage can miss worker-local hybrid page alignment.
+
+    The engine merges KV specs from every PP stage. If one stage has only
+    Mamba layers, its state page must be padded during global unification to
+    match the attention page used by stages that contain MLA layers.
+    """
+    attention_spec = new_kv_cache_spec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=192,
+        dtype=torch.bfloat16,
+        indexes_kv_by_block_stride=True,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=16,
+        shapes=((2560,),),
+        dtypes=(torch.float32,),
+        num_speculative_blocks=0,
+    )
+    assert attention_spec.page_size_bytes == 12 * 1024
+    assert mamba_spec.page_size_bytes == 10 * 1024
+
+    unified_specs = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "model.layers.0.self_attn": mamba_spec,
+            "model.layers.3.self_attn": attention_spec,
+        }
+    )
+
+    unified_mamba_spec = unified_specs["model.layers.0.self_attn"]
+    assert isinstance(unified_mamba_spec, MambaSpec)
+    assert unified_mamba_spec.block_size == mamba_spec.block_size
+    assert unified_mamba_spec.shapes == mamba_spec.shapes
+    assert unified_mamba_spec.page_size_padded == attention_spec.page_size_bytes
+    assert unified_mamba_spec.page_size_bytes == attention_spec.page_size_bytes
+
+
 def test_unify_hybrid_kv_cache_specs():
     # 1. has_full_attention and has_sliding_window
     before_spec_1 = new_kv_cache_spec()

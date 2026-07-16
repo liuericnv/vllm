@@ -1113,9 +1113,10 @@ def unify_kv_cache_spec_page_size(
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, first try to
     unify page size by increasing the block size of layers with smaller page
-    size. If a smaller attention page does not evenly divide the maximum page
-    size, keep its logical block size and pad its physical page instead --- but
-    only for attention layers whose backend opts in via
+    size. If a smaller page does not evenly divide the maximum page size, keep
+    its logical block size and pad its physical page instead. Mamba state-cache
+    pages support this directly. Attention pages support it only when their
+    backend opts in via
     ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is read through
     a strided view, which not every backend handles). Raise NotImplementedError
     if failed to unify the page size.
@@ -1142,6 +1143,8 @@ def unify_kv_cache_spec_page_size(
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
+            elif isinstance(layer_spec, MambaSpec):
+                new_spec = replace(layer_spec, page_size_padded=max_page_size)
             elif (
                 isinstance(layer_spec, AttentionSpec)
                 and layer_spec.indexes_kv_by_block_stride
